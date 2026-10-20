@@ -27,32 +27,40 @@ const LOSE_TOKENS: i128 = 2_0000000;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
+const BASE_SUBMITTER_BOND: i128 = 100_0000000; // 100 XLM
+const BASE_DISPUTER_BOND: i128  = 200_0000000; // 200 XLM
+const SUBMITTER_POOL_BPS: i128  = 500;         // 5% of total betting pool
+const DISPUTER_POOL_BPS: i128   = 1_000;       // 10% of total betting pool
+const DEFAULT_PAGE_LIMIT: u32   = 25;
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum MarketError {
-    AlreadyInitialized = 1,
-    NotInitialized     = 2,
-    NotAdmin           = 3,
-    MarketNotFound     = 4,
-    MarketExpired      = 5,
-    MarketNotExpired   = 6,
-    MarketResolved     = 7,
-    MarketCancelled    = 8,
-    MarketNotResolved  = 9,
-    BetTooSmall        = 10,
-    OppositeSideBet    = 11,
-    AlreadyClaimed     = 12,
-    NoBetFound         = 13,
-    InvalidAmount      = 14,
-    NoFeesToWithdraw   = 15,
-    NotResolver        = 16,
-    TooManyBets        = 17,
-    NotAuthorized      = 18,
-    MarketNotCancelled = 19,
-    RateLimitExceeded  = 20,
+    AlreadyInitialized    = 1,
+    NotInitialized        = 2,
+    NotAdmin              = 3,
+    MarketNotFound        = 4,
+    MarketExpired         = 5,
+    MarketNotExpired      = 6,
+    MarketResolved        = 7,
+    MarketCancelled       = 8,
+    MarketNotResolved     = 9,
+    BetTooSmall           = 10,
+    OppositeSideBet       = 11,
+    AlreadyClaimed        = 12,
+    NoBetFound            = 13,
+    InvalidAmount         = 14,
+    NoFeesToWithdraw      = 15,
+    NotResolver           = 16,
+    TooManyBets           = 17,
+    NotAuthorized         = 18,
+    MarketNotCancelled    = 19,
+    RateLimitExceeded     = 20,
+    CouncilWindowActive   = 21,
+    DisputeAlreadyHandled = 22,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -72,6 +80,41 @@ pub enum DataKey {
     FeeRecipient(Address),
     HasReferrer(Address),
     RateWindow,            // packed u64: high32=window_start_hi, low32=count
+    CouncilMembers,        // Vec<Address> on-chain council registry (#6)
+    CouncilMember(Address),
+    Dispute(u64),          // DisputeRecord for council window escape hatch (#8)
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub submitter:           Address,
+    pub submitter_bond:      i128,
+    pub challenger:          Address,
+    pub disputer_bond:       i128,
+    pub dispute_timestamp:   u64,
+    pub council_window_secs: u64,
+    pub refunded:            bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BettorsPage {
+    pub bettors:     Vec<Address>,
+    pub next_cursor: u32,
+    pub total:       u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BetPlacedEvent {
+    pub market_id:    u64,
+    pub bettor:       Address,
+    pub is_yes:       bool,
+    pub gross_amount: i128,
+    pub net_amount:   i128,
+    pub total_yes:    i128,
+    pub total_no:     i128,
 }
 
 // ── Config packed into one instance storage slot ───────────────────────────
@@ -247,6 +290,142 @@ impl PredictionMarketContract {
         Ok(())
     }
 
+    // ── Council Member Registry (#6) ──────────────────────────────────────
+
+    pub fn add_council_member(env: Env, admin: Address, member: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let key = DataKey::CouncilMember(member.clone());
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+            let mut members: Vec<Address> = env.storage().instance()
+                .get(&DataKey::CouncilMembers)
+                .unwrap_or_else(|| Vec::new(&env));
+            members.push_back(member);
+            env.storage().instance().set(&DataKey::CouncilMembers, &members);
+        }
+        Ok(())
+    }
+
+    pub fn remove_council_member(env: Env, admin: Address, member: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().persistent().remove(&DataKey::CouncilMember(member.clone()));
+        let members: Vec<Address> = env.storage().instance()
+            .get(&DataKey::CouncilMembers)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut updated: Vec<Address> = Vec::new(&env);
+        for i in 0..members.len() {
+            let m = members.get(i).unwrap();
+            if m != member {
+                updated.push_back(m);
+            }
+        }
+        env.storage().instance().set(&DataKey::CouncilMembers, &updated);
+        Ok(())
+    }
+
+    pub fn is_council_member(env: Env, member: Address) -> bool {
+        env.storage().persistent().get(&DataKey::CouncilMember(member)).unwrap_or(false)
+    }
+
+    pub fn get_council_members(env: Env) -> Vec<Address> {
+        env.storage().instance()
+            .get(&DataKey::CouncilMembers)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── Dynamic Bond Sizing & Council Expiry Escape Hatch (#8, #9) ────────
+
+    pub fn calculate_required_bond(env: Env, market_id: u64, is_dispute: bool) -> Result<i128, MarketError> {
+        let market = Self::load_market(&env, market_id)?;
+        let pool_volume = market.total_yes + market.total_no;
+        let (base_bond, bps) = if is_dispute {
+            (BASE_DISPUTER_BOND, DISPUTER_POOL_BPS)
+        } else {
+            (BASE_SUBMITTER_BOND, SUBMITTER_POOL_BPS)
+        };
+        let scaled = (pool_volume * bps) / BPS_DENOM;
+        Ok(if scaled > base_bond { scaled } else { base_bond })
+    }
+
+    pub fn open_dispute(
+        env: Env,
+        submitter: Address,
+        challenger: Address,
+        market_id: u64,
+        council_window_secs: u64,
+    ) -> Result<(), MarketError> {
+        submitter.require_auth();
+        challenger.require_auth();
+        let market = Self::load_market(&env, market_id)?;
+        if market.resolved  { return Err(MarketError::MarketResolved); }
+        if market.cancelled { return Err(MarketError::MarketCancelled); }
+
+        let submitter_bond = Self::calculate_required_bond(env.clone(), market_id, false)?;
+        let disputer_bond = Self::calculate_required_bond(env.clone(), market_id, true)?;
+
+        let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
+        let xlm = token::Client::new(&env, &cfg.xlm_sac);
+        let this = env.current_contract_address();
+        xlm.transfer(&submitter, &this, &submitter_bond);
+        xlm.transfer(&challenger, &this, &disputer_bond);
+
+        let record = DisputeRecord {
+            submitter,
+            submitter_bond,
+            challenger,
+            disputer_bond,
+            dispute_timestamp: env.ledger().timestamp(),
+            council_window_secs,
+            refunded: false,
+        };
+        let key = DataKey::Dispute(market_id);
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    pub fn reclaim_expired_dispute_bonds(
+        env: Env,
+        caller: Address,
+        market_id: u64,
+    ) -> Result<(i128, i128), MarketError> {
+        caller.require_auth();
+        let mut market = Self::load_market(&env, market_id)?;
+        if market.resolved { return Err(MarketError::MarketResolved); }
+
+        let key = DataKey::Dispute(market_id);
+        let mut dispute: DisputeRecord = env.storage().persistent().get(&key)
+            .ok_or(MarketError::MarketNotFound)?;
+        if dispute.refunded { return Err(MarketError::DisputeAlreadyHandled); }
+
+        let now = env.ledger().timestamp();
+        if now < dispute.dispute_timestamp + dispute.council_window_secs {
+            return Err(MarketError::CouncilWindowActive);
+        }
+
+        dispute.refunded = true;
+        env.storage().persistent().set(&key, &dispute);
+        env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+
+        if !market.cancelled {
+            market.cancelled = true;
+            let mkt_key = DataKey::Market(market_id);
+            env.storage().persistent().set(&mkt_key, &market);
+            env.storage().persistent().extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        }
+
+        let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
+        let xlm = token::Client::new(&env, &cfg.xlm_sac);
+        let this = env.current_contract_address();
+        xlm.transfer(&this, &dispute.submitter, &dispute.submitter_bond);
+        xlm.transfer(&this, &dispute.challenger, &dispute.disputer_bond);
+
+        Ok((dispute.submitter_bond, dispute.disputer_bond))
+    }
+
     // ── Market Management ─────────────────────────────────────────────────
 
     pub fn create_market(
@@ -375,7 +554,6 @@ impl PredictionMarketContract {
             let cnt_key = DataKey::BettorCount(market_id);
             let count: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
             let slot_key = DataKey::BettorAt(market_id, count);
-            // OPT: no clone — user is moved here and we don't need it after
             env.storage().persistent().set(&slot_key, &user);
             env.storage().persistent().extend_ttl(&slot_key, TTL_BUMP, TTL_HIGH);
             let new_count = count + 1;
@@ -389,6 +567,19 @@ impl PredictionMarketContract {
         let mkt_key = DataKey::Market(market_id);
         env.storage().persistent().set(&mkt_key, &market);
         env.storage().persistent().extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+
+        env.events().publish(
+            (Symbol::new(&env, "bet_placed"), market_id, user.clone()),
+            BetPlacedEvent {
+                market_id,
+                bettor: user,
+                is_yes,
+                gross_amount: amount,
+                net_amount: net,
+                total_yes: market.total_yes,
+                total_no: market.total_no,
+            },
+        );
         Ok(())
     }
 
