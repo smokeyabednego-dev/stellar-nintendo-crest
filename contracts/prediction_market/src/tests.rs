@@ -1034,3 +1034,40 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.xlm.balance(&charlie), charlie_before);
 }
 
+// ── 43. Configurable submitter and disputer bond parameters (#10) ────────────
+
+#[test]
+fn test_configurable_bond_parameters() {
+    let t = setup();
+    let defaults = t.client.get_bond_config();
+    assert_eq!(defaults.submitter_bond, 100_0000000);
+    assert_eq!(defaults.disputer_bond, 200_0000000);
+
+    t.client.set_bond_config(&t.admin, &150_0000000_i128, &300_0000000_i128);
+    let updated = t.client.get_bond_config();
+    assert_eq!(updated.submitter_bond, 150_0000000);
+    assert_eq!(updated.disputer_bond, 300_0000000);
+}
+
+// ── 44. Packed market outcome and state flags (#11) ──────────────────────────
+
+#[test]
+fn test_packed_market_state_flags() {
+    let t = setup();
+    let id = create_test_market(&t);
+    assert_eq!(t.client.get_market_state_flags(&id), 0);
+
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+    assert_eq!(t.client.get_market_state_flags(&id), FLAG_RESOLVED | FLAG_OUTCOME);
+
+    let id2 = create_test_market(&t);
+    t.client.cancel_market(&t.admin, &id2);
+    assert_eq!(t.client.get_market_state_flags(&id2), FLAG_CANCELLED);
+}
+
+

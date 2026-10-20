@@ -27,6 +27,14 @@ const LOSE_TOKENS: i128 = 2_0000000;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
+const DEFAULT_SUBMITTER_BOND: i128 = 100_0000000; // 100 XLM
+const DEFAULT_DISPUTER_BOND: i128  = 200_0000000; // 200 XLM
+
+// Packed market state flag bitmasks (#11)
+pub const FLAG_RESOLVED: u32  = 1 << 0;
+pub const FLAG_OUTCOME: u32   = 1 << 1;
+pub const FLAG_CANCELLED: u32 = 1 << 2;
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -65,6 +73,7 @@ pub enum DataKey {
     MarketCount,
     AccumulatedFees,
     Market(u64),
+    MarketFlags(u64),      // packed u32 bitmask of resolved/outcome/cancelled (#11)
     Bet(u64, Address),     // net + gross + count packed; see BetEntry
     BettorCount(u64),
     BettorAt(u64, u32),
@@ -72,6 +81,55 @@ pub enum DataKey {
     FeeRecipient(Address),
     HasReferrer(Address),
     RateWindow,            // packed u64: high32=window_start_hi, low32=count
+    BondConfig,            // dynamic submitter and disputer bond config (#10)
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BondParams {
+    pub submitter_bond: i128,
+    pub disputer_bond:  i128,
+}
+
+// ── Typed Contract Events (#1, #2) ────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BetPlacedEvent {
+    pub market_id:    u64,
+    pub bettor:       Address,
+    pub is_yes:       bool,
+    pub gross_amount: i128,
+    pub net_amount:   i128,
+    pub total_yes:    i128,
+    pub total_no:     i128,
+    pub timestamp:    u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketCreatedEvent {
+    pub market_id: u64,
+    pub creator:   Address,
+    pub category:  Category,
+    pub end_time:  u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketResolvedEvent {
+    pub market_id: u64,
+    pub resolver:  Address,
+    pub outcome:   bool,
+    pub total_yes: i128,
+    pub total_no:  i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketCancelledEvent {
+    pub market_id: u64,
+    pub admin:     Address,
 }
 
 // ── Config packed into one instance storage slot ───────────────────────────
@@ -247,6 +305,61 @@ impl PredictionMarketContract {
         Ok(())
     }
 
+    // ── Bond Configuration (#10) ──────────────────────────────────────────
+
+    pub fn set_bond_config(
+        env: Env,
+        admin: Address,
+        submitter_bond: i128,
+        disputer_bond: i128,
+    ) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        if submitter_bond <= 0 || disputer_bond < submitter_bond {
+            return Err(MarketError::InvalidAmount);
+        }
+        env.storage().instance().set(&DataKey::BondConfig, &BondParams {
+            submitter_bond,
+            disputer_bond,
+        });
+        Ok(())
+    }
+
+    pub fn get_bond_config(env: Env) -> BondParams {
+        env.storage().instance().get(&DataKey::BondConfig).unwrap_or(BondParams {
+            submitter_bond: DEFAULT_SUBMITTER_BOND,
+            disputer_bond: DEFAULT_DISPUTER_BOND,
+        })
+    }
+
+    // ── Packed Market State Flags (#11) ───────────────────────────────────
+
+    pub fn get_market_state_flags(env: Env, market_id: u64) -> Result<u32, MarketError> {
+        if let Some(flags) = env.storage().persistent().get::<DataKey, u32>(&DataKey::MarketFlags(market_id)) {
+            return Ok(flags);
+        }
+        let market = Self::load_market(&env, market_id)?;
+        Ok(Self::pack_market_flags(market.resolved, market.outcome, market.cancelled))
+    }
+
+    #[inline]
+    fn pack_market_flags(resolved: bool, outcome: bool, cancelled: bool) -> u32 {
+        let mut flags = 0u32;
+        if resolved  { flags |= FLAG_RESOLVED; }
+        if outcome   { flags |= FLAG_OUTCOME; }
+        if cancelled { flags |= FLAG_CANCELLED; }
+        flags
+    }
+
+    #[inline]
+    fn unpack_market_flags(flags: u32) -> (bool, bool, bool) {
+        (
+            (flags & FLAG_RESOLVED) != 0,
+            (flags & FLAG_OUTCOME) != 0,
+            (flags & FLAG_CANCELLED) != 0,
+        )
+    }
+
     // ── Market Management ─────────────────────────────────────────────────
 
     pub fn create_market(
@@ -269,22 +382,35 @@ impl PredictionMarketContract {
             id: market_id,
             question,
             image_url,
-            category,
+            category: category.clone(),
             end_time,
             total_yes: 0,
             total_no: 0,
             resolved: false,
             outcome: false,
             cancelled: false,
-            creator: admin,
+            creator: admin.clone(),
             bet_count: 0,
         };
 
         let mkt_key = DataKey::Market(market_id);
         env.storage().persistent().set(&mkt_key, &market);
         env.storage().persistent().extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        let flags_key = DataKey::MarketFlags(market_id);
+        env.storage().persistent().set(&flags_key, &0_u32);
+        env.storage().persistent().extend_ttl(&flags_key, TTL_BUMP, TTL_HIGH);
         // OPT: removed BettorCount write here — now written lazily on first bet
         env.storage().instance().set(&DataKey::MarketCount, &market_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "market_created"), market_id),
+            MarketCreatedEvent {
+                market_id,
+                creator: admin,
+                category,
+                end_time,
+            },
+        );
 
         Ok(market_id)
     }
@@ -375,7 +501,6 @@ impl PredictionMarketContract {
             let cnt_key = DataKey::BettorCount(market_id);
             let count: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
             let slot_key = DataKey::BettorAt(market_id, count);
-            // OPT: no clone — user is moved here and we don't need it after
             env.storage().persistent().set(&slot_key, &user);
             env.storage().persistent().extend_ttl(&slot_key, TTL_BUMP, TTL_HIGH);
             let new_count = count + 1;
@@ -389,6 +514,21 @@ impl PredictionMarketContract {
         let mkt_key = DataKey::Market(market_id);
         env.storage().persistent().set(&mkt_key, &market);
         env.storage().persistent().extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+
+        // Emit BetPlacedEvent (#1)
+        env.events().publish(
+            (Symbol::new(&env, "bet_placed"), market_id, user.clone()),
+            BetPlacedEvent {
+                market_id,
+                bettor: user,
+                is_yes,
+                gross_amount: amount,
+                net_amount: net,
+                total_yes: market.total_yes,
+                total_no: market.total_no,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
         Ok(())
     }
 
@@ -424,6 +564,21 @@ impl PredictionMarketContract {
         let mkt_key = DataKey::Market(market_id);
         env.storage().persistent().set(&mkt_key, &market);
         env.storage().persistent().extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        let flags_key = DataKey::MarketFlags(market_id);
+        let packed_flags = Self::pack_market_flags(true, outcome, false);
+        env.storage().persistent().set(&flags_key, &packed_flags);
+        env.storage().persistent().extend_ttl(&flags_key, TTL_BUMP, TTL_HIGH);
+
+        env.events().publish(
+            (Symbol::new(&env, "market_resolved"), market_id),
+            MarketResolvedEvent {
+                market_id,
+                resolver: caller,
+                outcome,
+                total_yes: market.total_yes,
+                total_no: market.total_no,
+            },
+        );
         Ok(())
     }
 
@@ -441,6 +596,10 @@ impl PredictionMarketContract {
         let mkt_key = DataKey::Market(market_id);
         env.storage().persistent().set(&mkt_key, &market);
         env.storage().persistent().extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        let flags_key = DataKey::MarketFlags(market_id);
+        let packed_flags = Self::pack_market_flags(false, false, true);
+        env.storage().persistent().set(&flags_key, &packed_flags);
+        env.storage().persistent().extend_ttl(&flags_key, TTL_BUMP, TTL_HIGH);
 
         // Reclaim fees — net * fee_rate / (1 - fee_rate)
         let net_pool    = market.total_yes + market.total_no;
@@ -448,6 +607,14 @@ impl PredictionMarketContract {
         let mut acc_fees: i128 = env.storage().instance().get(&DataKey::AccumulatedFees).unwrap_or(0);
         acc_fees = if fees_in_pool < acc_fees { acc_fees - fees_in_pool } else { 0 };
         env.storage().instance().set(&DataKey::AccumulatedFees, &acc_fees);
+
+        env.events().publish(
+            (Symbol::new(&env, "market_cancelled"), market_id),
+            MarketCancelledEvent {
+                market_id,
+                admin,
+            },
+        );
 
         Ok(())
     }
