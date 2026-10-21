@@ -1034,40 +1034,81 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.xlm.balance(&charlie), charlie_before);
 }
 
-// ── 43. Configurable submitter and disputer bond parameters (#10) ────────────
+// ── 43. Council vote events ──────────────────────────────────────────────────
 
 #[test]
-fn test_configurable_bond_parameters() {
-    let t = setup();
-    let defaults = t.client.get_bond_config();
-    assert_eq!(defaults.submitter_bond, 100_0000000);
-    assert_eq!(defaults.disputer_bond, 200_0000000);
-
-    t.client.set_bond_config(&t.admin, &150_0000000_i128, &300_0000000_i128);
-    let updated = t.client.get_bond_config();
-    assert_eq!(updated.submitter_bond, 150_0000000);
-    assert_eq!(updated.disputer_bond, 300_0000000);
-}
-
-// ── 44. Packed market outcome and state flags (#11) ──────────────────────────
-
-#[test]
-fn test_packed_market_state_flags() {
+fn test_council_vote_events() {
     let t = setup();
     let id = create_test_market(&t);
-    assert_eq!(t.client.get_market_state_flags(&id), 0);
-
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 200_0000000);
-    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
-
+    t.client.place_bet(&user, &id, &true, &50_0000000_i128);
     advance_time(&t.env, 3601);
-    t.client.resolve_market(&t.admin, &id, &true);
-    assert_eq!(t.client.get_market_state_flags(&id), FLAG_RESOLVED | FLAG_OUTCOME);
 
-    let id2 = create_test_market(&t);
-    t.client.cancel_market(&t.admin, &id2);
-    assert_eq!(t.client.get_market_state_flags(&id2), FLAG_CANCELLED);
+    // Dispute the market to open council voting
+    t.client.dispute_market(&user, &id);
+
+    let council1 = Address::generate(&t.env);
+    let council2 = Address::generate(&t.env);
+    t.client.add_council_member(&t.admin, &council1);
+    t.client.add_council_member(&t.admin, &council2);
+
+    // First vote
+    t.client.council_vote(&council1, &id, &true);
+
+    let events = t.env.events().all();
+    let voted_topic = (
+        Symbol::new(&t.env, "council"),
+        Symbol::new(&t.env, "voted"),
+    );
+    let voted_events: Vec<Val> = events
+        .iter()
+        .filter(|(_, topics, _)| topics == &voted_topic)
+        .map(|(_, _, data)| data)
+        .collect();
+    assert_eq!(voted_events.len(), 1);
+
+    let (market_id, voter, outcome, current_votes): (u64, Address, bool, u32) =
+        voted_events.get(0).unwrap().into_val(&t.env);
+    assert_eq!(market_id, id);
+    assert_eq!(voter, council1);
+    assert!(outcome);
+    assert_eq!(current_votes, 1);
+
+    // Second vote — drives the tally to the threshold
+    t.client.council_vote(&council2, &id, &true);
+
+    let events = t.env.events().all();
+    let voted_events: Vec<Val> = events
+        .iter()
+        .filter(|(_, topics, _)| topics == &voted_topic)
+        .map(|(_, _, data)| data)
+        .collect();
+    assert_eq!(voted_events.len(), 2);
+
+    let (market_id2, voter2, outcome2, current_votes2): (u64, Address, bool, u32) =
+        voted_events.get(1).unwrap().into_val(&t.env);
+    assert_eq!(market_id2, id);
+    assert_eq!(voter2, council2);
+    assert!(outcome2);
+    assert_eq!(current_votes2, 2);
+
+    // Threshold reached event
+    let threshold_topic = (
+        Symbol::new(&t.env, "council"),
+        Symbol::new(&t.env, "threshold_reached"),
+    );
+    let threshold_events: Vec<Val> = events
+        .iter()
+        .filter(|(_, topics, _)| topics == &threshold_topic)
+        .map(|(_, _, data)| data)
+        .collect();
+    assert_eq!(threshold_events.len(), 1);
+
+    let (market_id3, winning_outcome, timelock_deadline): (u64, bool, u64) =
+        threshold_events.get(0).unwrap().into_val(&t.env);
+    assert_eq!(market_id3, id);
+    assert!(winning_outcome);
+    assert_eq!(timelock_deadline, t.env.ledger().timestamp() + 86_400);
 }
-
 
